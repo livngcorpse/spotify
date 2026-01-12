@@ -2,7 +2,11 @@ python-telegram-bot==20.7
 spotipy==2.23.0
 yt-dlp==2024.12.13
 python-dotenv==1.0.0
-py-tgcalls==0.9.7
+py-tgcalls==2.2.8
+# Pyrogram client for Telegram API
 pyrogram==2.0.106
+# Fast cryptographic library for Pyrogram (optional but recommended)
+# On Windows, you might need Visual C++ Build Tools to install this
 TgCrypto==1.2.5
+# Audio processing
 ffmpeg-python==0.2.0

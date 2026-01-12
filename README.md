@@ -1,6 +1,47 @@
 # Telegram Music Bot with Spotify Playlist Support 🎵
 
-A fully functional Telegram music bot that plays music in voice chats with support for importing entire Spotify playlists!
+A **fully functional** Telegram music bot that plays music in voice chats with support for importing entire Spotify playlists!
+
+## ⚡ Quick Start
+
+```bash
+# 1. Clone/download the repository
+# 2. Install FFmpeg (see Prerequisites)
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Copy and configure .env
+# On Windows:
+copy .env.example .env
+# On Linux/Mac:
+cp .env.example .env
+# Edit .env with your credentials
+
+# 5. Test setup (optional but recommended)
+python test_setup.py
+
+# 6. Run the bot
+python telegram_music_bot.py
+```
+
+**For Windows users:**
+```powershell
+# 1. Clone/download the repository
+# 2. Install FFmpeg (see Prerequisites)
+# 3. Install dependencies
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+# 4. Copy and configure .env
+copy .env.example .env
+# Edit .env with your credentials
+
+# 5. Test setup (optional but recommended)
+python test_setup.py
+
+# 6. Run the bot
+python telegram_music_bot.py
+```
 
 ## Features
 
@@ -25,6 +66,7 @@ A fully functional Telegram music bot that plays music in voice chats with suppo
      - Download from [ffmpeg.org](https://ffmpeg.org/download.html)
      - Extract and add to PATH
      - Or use: `choco install ffmpeg` (if you have Chocolatey)
+     - Alternative: `winget install Gyan.FFmpeg`
    - **Linux**: 
      ```bash
      sudo apt update
@@ -35,9 +77,15 @@ A fully functional Telegram music bot that plays music in voice chats with suppo
      brew install ffmpeg
      ```
 
-3. **Verify FFmpeg installation**:
+3. **Visual C++ Build Tools** (for Windows users):
+   - Some packages require compilation
+   - Download from [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+   - Or install Visual Studio with C++ support
+
+4. **Verify installations**:
    ```bash
    ffmpeg -version
+   python --version
    ```
 
 ## Setup Guide
@@ -93,7 +141,22 @@ pip install -r requirements.txt
    SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
    ```
 
-### 6. Run the Bot
+### 6. Test Your Setup (Optional but Recommended)
+
+Run the test script to verify everything is configured correctly:
+
+```bash
+python test_setup.py
+```
+
+This will check:
+- All required packages are installed
+- FFmpeg is available
+- .env file has all credentials
+- Spotify API is working
+- YouTube search is working
+
+### 7. Run the Bot
 
 ```bash
 python telegram_music_bot.py
@@ -101,8 +164,15 @@ python telegram_music_bot.py
 
 You should see:
 ```
-🤖 Bot is running...
-Make sure to start a voice chat in your group!
+🚀 Starting bot...
+✅ Pyrogram client started
+✅ PyTgCalls started
+🤖 Bot is running!
+📝 Make sure to:
+   1. Add bot to your group
+   2. Make bot admin with 'Manage Voice Chats' permission
+   3. Start a voice chat in the group
+   4. Use /play command to start playing music
 ```
 
 ## Usage
@@ -159,8 +229,9 @@ Make sure to start a voice chat in your group!
 1. User sends `/play Bohemian Rhapsody`
 2. Bot searches YouTube for the song
 3. Bot joins voice chat (if not already in)
-4. Bot streams audio directly to voice chat
-5. When song ends, plays next in queue automatically
+4. Bot streams audio directly to voice chat using MediaStream
+5. When song ends, `on_stream_end` event fires automatically
+6. Bot plays next song in queue
 
 ### Playlist Flow
 1. User sends `/play <spotify playlist link>`
@@ -168,15 +239,17 @@ Make sure to start a voice chat in your group!
 3. Bot extracts song names and artist names
 4. All songs are added to the queue
 5. Bot searches YouTube for each song when it's time to play
-6. Songs play in order automatically
+6. Songs play in order automatically via the event handler
 
 ### Technical Details
-- Uses **PyTgCalls** for voice chat integration
-- Uses **yt-dlp** to search and stream from YouTube
-- Uses **Spotipy** to fetch playlist data
-- Audio is streamed directly (not downloaded)
-- FFmpeg handles audio processing
+- Uses **PyTgCalls** for voice chat integration with proper event handlers
+- Uses **yt-dlp** to search and get stream URLs from YouTube
+- Uses **Spotipy** to fetch playlist data from Spotify API
+- Audio is streamed directly via `MediaStream` (not downloaded)
+- FFmpeg handles audio processing in the background
 - Each chat has its own independent queue
+- **Event-driven architecture**: `@calls.on_stream_end()` decorator handles automatic progression
+- Proper async/await flow prevents race conditions
 
 ## Troubleshooting
 
@@ -214,7 +287,13 @@ Make sure to start a voice chat in your group!
 - ✓ Install build tools:
   - Linux: `sudo apt install python3-dev build-essential`
   - Mac: `xcode-select --install`
-- ✓ Try: `pip install --upgrade py-tgcalls`
+  - Windows: Install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+- ✓ For TgCrypto installation issues on Windows:
+  - Try: `pip install --upgrade py-tgcalls` and `pip install pyrogram`
+  - TgCrypto is optional - Pyrogram will work with pure Python crypto (slower but functional)
+  - If TgCrypto fails to install, the bot will still work but with reduced performance
+- ✓ If you get compiler errors, try installing pre-compiled wheels:
+  - `pip install --only-binary=all -r requirements.txt`
 
 ## Advanced Configuration
 
@@ -253,7 +332,7 @@ telegram-music-bot/
 ├── .env.example              # Template for credentials
 ├── .gitignore               # Git ignore file
 ├── README.md                # This file
-└── music_bot.session        # Auto-generated (don't delete while running)
+└── music_bot.session        # Auto-generated session file (ignored by git)
 ```
 
 ## Notes & Limitations
@@ -263,7 +342,22 @@ telegram-music-bot/
 - Some songs may not be available due to regional restrictions
 - Playlist import works only with **public** Spotify playlists
 - Bot requires stable internet connection
-- Queue display limited to 20 songs (can be changed in code)
+- Queue display limited to 15 songs (can be changed in code)
+
+## What Makes This Version Fully Working?
+
+This implementation includes critical fixes that make it production-ready:
+
+1. **Event-Driven Architecture**: Uses `@calls.on_stream_end()` decorator to automatically play next song when current finishes
+2. **Proper Async Handling**: Correct use of async/await prevents blocking and race conditions
+3. **MediaStream API**: Uses the correct `MediaStream` class instead of deprecated `AudioPiped`
+4. **Error Recovery**: Handles GroupCallNotFound, NoActiveGroupCall, and other exceptions gracefully
+5. **State Management**: Properly tracks playing state, queue, and currently playing info per chat
+6. **Session Handling**: Correctly initializes Pyrogram and PyTgCalls in the right order
+7. **API ID Conversion**: Converts API_ID to int (required by Pyrogram)
+8. **Test Suite**: Includes `test_setup.py` to catch configuration issues before running
+9. **Better UX**: Uses Markdown formatting, proper emoji, and informative messages
+10. **Clean Shutdown**: Handles Ctrl+C gracefully
 
 ## Security
 

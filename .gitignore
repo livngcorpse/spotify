@@ -1,2 +1,45 @@
+# Environment variables
 .env
-.cache
+
+# Session files
+*.session
+
+# Cache
+cache/
+.cache/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Compiled Python
+*.pyc
+__pycache__/
+*.pyo
+
+# Backup
+test_*.py
+*_backup.py
+
+# Runtime logs
+*.log
+runtime.log
+
+# Processed files
+*.tmp
+*.temp
