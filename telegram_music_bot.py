@@ -95,9 +95,11 @@ YDL_OPTIONS = {
     'default_search': 'auto',
     'source_address': '0.0.0.0',
     'extract_flat': False,
-    'socket_timeout': 10,
-    'connect_timeout': 10,
-    'read_timeout': 30,
+    'socket_timeout': 15,
+    'connect_timeout': 15,
+    'read_timeout': 60,
+    'extractor_retries': 3,
+    'retry_sleep_functions': {'http': 1},
 }
 
 # Queue and playback state management
@@ -105,11 +107,11 @@ music_queue = {}
 currently_playing = {}
 is_playing = {}
 
-telegram_app_instance = None
+# Track active voice chats to ensure proper cleanup
+active_voice_chats = set()
 
-def set_telegram_app(app):
-    global telegram_app_instance
-    telegram_app_instance = app
+# Global app instance with better error handling
+telegram_app_instance = None
 
 async def send_message_to_chat(chat_id, message):
     """Send a message to a specific chat"""
@@ -120,13 +122,64 @@ async def send_message_to_chat(chat_id, message):
         except Exception as e:
             logger.error(f"Failed to send message to chat {chat_id}: {e}")
     else:
-        logger.warning(f"Telegram app instance not set, can't send message to {chat_id}")
+        logger.error(f"Telegram app instance not set, can't send message to {chat_id}")
+        # Fallback: log the message that should have been sent
+        logger.info(f"Would send to chat {chat_id}: {message}")
+
+def set_telegram_app(app):
+    global telegram_app_instance
+    telegram_app_instance = app
+    logger.info("Telegram app instance set successfully")
+
+
+def sanitize_input(input_str, max_length=200):
+    """Sanitize user input to prevent potential issues"""
+    if not input_str:
+        return ""
+    
+    # Limit length
+    input_str = input_str[:max_length]
+    
+    # Remove potentially harmful characters (keep alphanumeric, spaces, common symbols)
+    sanitized = "".join(c for c in input_str if c.isprintable() and ord(c) < 128)
+    
+    # Basic URL validation for Spotify links
+    if "spotify.com" in sanitized:
+        # Only allow valid Spotify URL patterns
+        import re
+        spotify_pattern = r"https?://open\.spotify\.com/(playlist|track|album)/[a-zA-Z0-9]+"
+        if not re.match(spotify_pattern, sanitized):
+            logger.warning(f"Invalid Spotify URL pattern detected: {sanitized}")
+            return ""
+    
+    return sanitized.strip()
+
+def _make_spotify_request(func, *args, **kwargs):
+    """Wrapper for Spotify API calls with rate limit handling"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if "rate limit" in str(e).lower() or "429" in str(e):
+                logger.warning(f"Spotify rate limit hit on attempt {attempt + 1}, waiting before retry...")
+                time.sleep(2 ** attempt)  # Exponential backoff
+            elif "authentication" in str(e).lower() or "401" in str(e) or "403" in str(e):
+                logger.error(f"Spotify authentication error: {e}")
+                raise
+            else:
+                if attempt == max_retries - 1:  # Last attempt
+                    logger.error(f"Spotify API error after {max_retries} attempts: {e}")
+                    raise
+                logger.warning(f"Spotify API error on attempt {attempt + 1}: {e}, retrying...")
+                time.sleep(2 ** attempt)
+
 
 def get_spotify_tracks(playlist_link):
     """Extract all tracks from Spotify playlist"""
     tracks = []
     try:
-        results = sp.playlist_items(playlist_link)
+        results = _make_spotify_request(sp.playlist_items, playlist_link)
         
         while results:
             for item in results["items"]:
@@ -143,6 +196,11 @@ def get_spotify_tracks(playlist_link):
     return tracks
 
 import concurrent.futures
+import threading
+import time
+
+# Thread locks for queue operations to prevent race conditions
+queue_locks = {}
 
 async def search_youtube_async(query, max_retries=3):
     """Asynchronously search YouTube for a song and return audio URL with retry logic"""
@@ -178,11 +236,7 @@ def search_youtube_sync(query):
             logger.warning(f"Video unavailable for '{query}'")
     return None
 
-# Keep the old function for backward compatibility
-def search_youtube(query):
-    """Search YouTube for a song and return audio URL"""
-    logger.warning("Using deprecated synchronous search_youtube function")
-    return search_youtube_sync(query)
+
 
 # Event handler for when stream ends
 @calls.on_stream_end()
@@ -192,19 +246,27 @@ async def on_stream_end(client, update):
     
     logger.info(f"Stream ended in chat {chat_id}")
     
-    if chat_id in music_queue and music_queue[chat_id]:
-        music_queue[chat_id].pop(0)  # Remove finished song
-        
-        if music_queue[chat_id]:
-            # Play next song
-            await play_next_song(chat_id)
-        else:
-            # Queue empty, leave call
-            is_playing[chat_id] = False
-            try:
-                await calls.leave_group_call(chat_id)
-            except:
-                pass
+    # Get or create lock for this chat
+    if chat_id not in queue_locks:
+        queue_locks[chat_id] = threading.Lock()
+    
+    with queue_locks[chat_id]:
+        if chat_id in music_queue and music_queue[chat_id]:
+            # Check if the queue still has items and remove the finished song
+            if music_queue[chat_id]:
+                music_queue[chat_id].pop(0)  # Remove finished song
+                
+                if music_queue[chat_id]:
+                    # Play next song
+                    await play_next_song(chat_id)
+                else:
+                    # Queue empty, leave call
+                    is_playing[chat_id] = False
+                    active_voice_chats.discard(chat_id)  # Remove from active voice chats
+                    try:
+                        await calls.leave_group_call(chat_id)
+                    except:
+                        pass
 
 async def play_next_song(chat_id):
     """Play the next song in queue for a specific chat"""
@@ -244,6 +306,7 @@ async def play_next_song(chat_id):
                 MediaStream(result['url'])
             )
             is_playing[chat_id] = True
+            active_voice_chats.add(chat_id)
             logger.info(f"Now playing in {chat_id}: {result['title']}")
             return  # Success, exit the function
         except NoActiveGroupCall:
@@ -298,6 +361,13 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     query = " ".join(context.args)
     
+    # Sanitize the user input
+    query = sanitize_input(query)
+    
+    if not query:
+        await update.message.reply_text("❌ Invalid input provided.")
+        return
+    
     # Initialize queue for this chat
     if chat_id not in music_queue:
         music_queue[chat_id] = []
@@ -308,7 +378,7 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text("🔍 Fetching playlist tracks...")
         
         try:
-            tracks = get_spotify_tracks(query)
+            tracks = await get_spotify_tracks_async(query)
             if not tracks:
                 await msg.edit_text("❌ Couldn't fetch playlist. Make sure it's public!")
                 return
@@ -386,28 +456,34 @@ async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Skip current song"""
     chat_id = update.effective_chat.id
     
-    if chat_id in music_queue and music_queue[chat_id]:
-        skipped = music_queue[chat_id].pop(0)
-        await update.message.reply_text(f"⏭ Skipped: *{skipped}*", parse_mode='Markdown')
-        
-        if music_queue[chat_id]:
-            await play_next_song(chat_id)
-            await asyncio.sleep(1)
-            if chat_id in currently_playing:
-                info = currently_playing[chat_id]
-                await update.message.reply_text(
-                    f"▶️ *Now Playing:*\n{info['title']}",
-                    parse_mode='Markdown'
-                )
+    # Get or create lock for this chat
+    if chat_id not in queue_locks:
+        queue_locks[chat_id] = threading.Lock()
+    
+    with queue_locks[chat_id]:
+        if chat_id in music_queue and music_queue[chat_id]:
+            skipped = music_queue[chat_id].pop(0)
+            await update.message.reply_text(f"⏭ Skipped: *{skipped}*", parse_mode='Markdown')
+            
+            if music_queue[chat_id]:
+                await play_next_song(chat_id)
+                await asyncio.sleep(1)
+                if chat_id in currently_playing:
+                    info = currently_playing[chat_id]
+                    await update.message.reply_text(
+                        f"▶️ *Now Playing:*\n{info['title']}",
+                        parse_mode='Markdown'
+                    )
+            else:
+                is_playing[chat_id] = False
+                active_voice_chats.discard(chat_id)  # Remove from active voice chats
+                try:
+                    await calls.leave_group_call(chat_id)
+                except:
+                    pass
+                await update.message.reply_text("✅ Queue is now empty!")
         else:
-            is_playing[chat_id] = False
-            try:
-                await calls.leave_group_call(chat_id)
-            except:
-                pass
-            await update.message.reply_text("✅ Queue is now empty!")
-    else:
-        await update.message.reply_text("❌ Nothing to skip!")
+            await update.message.reply_text("❌ Nothing to skip!")
 
 async def now_playing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show currently playing song"""
@@ -457,17 +533,23 @@ async def clear_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear the queue"""
     chat_id = update.effective_chat.id
     
-    if chat_id in music_queue and music_queue[chat_id]:
-        count = len(music_queue[chat_id])
-        music_queue[chat_id] = []
-        is_playing[chat_id] = False
-        try:
-            await calls.leave_group_call(chat_id)
-        except:
-            pass
-        await update.message.reply_text(f"✅ Cleared {count} songs from queue!")
-    else:
-        await update.message.reply_text("📋 Queue is already empty!")
+    # Get or create lock for this chat
+    if chat_id not in queue_locks:
+        queue_locks[chat_id] = threading.Lock()
+    
+    with queue_locks[chat_id]:
+        if chat_id in music_queue and music_queue[chat_id]:
+            count = len(music_queue[chat_id])
+            music_queue[chat_id] = []
+            is_playing[chat_id] = False
+            active_voice_chats.discard(chat_id)  # Remove from active voice chats
+            try:
+                await calls.leave_group_call(chat_id)
+            except:
+                pass
+            await update.message.reply_text(f"✅ Cleared {count} songs from queue!")
+        else:
+            await update.message.reply_text("📋 Queue is already empty!")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stop playing and leave voice chat"""
@@ -480,6 +562,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del currently_playing[chat_id]
     
     is_playing[chat_id] = False
+    active_voice_chats.discard(chat_id)  # Remove from active voice chats
     
     try:
         await calls.leave_group_call(chat_id)
@@ -554,13 +637,16 @@ def cleanup_resources():
         logger.error(f"Error stopping Pyrogram client: {e}")
     
     # Leave all active voice chats
-    for chat_id in music_queue:
+    for chat_id in active_voice_chats:
         try:
             loop = asyncio.get_event_loop()
             loop.run_until_complete(calls.leave_group_call(chat_id))
             logger.info(f"✅ Left voice chat in {chat_id}")
         except Exception as e:
             logger.error(f"Error leaving voice chat in {chat_id}: {e}")
+    
+    # Clear the active voice chats set
+    active_voice_chats.clear()
     
     logger.info("👋 Bot stopped!")
 
