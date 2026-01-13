@@ -1,5 +1,8 @@
 import os
+import sys
+import subprocess
 import asyncio
+import logging
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -12,14 +15,45 @@ from pytgcalls.exceptions import GroupCallNotFound, NoActiveGroupCall
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
-# Configuration
+# Validate environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_ID = int(os.getenv("API_ID"))
+API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+# Validate required environment variables
+missing_vars = []
+if not TELEGRAM_BOT_TOKEN:
+    missing_vars.append("TELEGRAM_BOT_TOKEN")
+if not API_ID:
+    missing_vars.append("API_ID")
+else:
+    try:
+        API_ID = int(API_ID)
+    except ValueError:
+        logger.error("API_ID must be an integer")
+        sys.exit(1)
+if not API_HASH:
+    missing_vars.append("API_HASH")
+if not SPOTIFY_CLIENT_ID:
+    missing_vars.append("SPOTIFY_CLIENT_ID")
+if not SPOTIFY_CLIENT_SECRET:
+    missing_vars.append("SPOTIFY_CLIENT_SECRET")
+
+if missing_vars:
+    logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+    logger.error("Please check your .env file and ensure all required variables are set.")
+    sys.exit(1)
 
 # Pyrogram client for voice calls
 pyrogram_app = Client(
@@ -40,6 +74,15 @@ sp = spotipy.Spotify(
     )
 )
 
+# Check if FFmpeg is available
+try:
+    subprocess.check_output(['ffmpeg', '-version'])
+    logger.info("FFmpeg is available")
+except (subprocess.CalledProcessError, FileNotFoundError):
+    logger.error("FFmpeg is not installed or not in system PATH")
+    logger.error("Please install FFmpeg from https://ffmpeg.org/download.html")
+    sys.exit(1)
+
 # YT-DLP options
 YDL_OPTIONS = {
     'format': 'bestaudio/best',
@@ -52,12 +95,32 @@ YDL_OPTIONS = {
     'default_search': 'auto',
     'source_address': '0.0.0.0',
     'extract_flat': False,
+    'socket_timeout': 10,
+    'connect_timeout': 10,
+    'read_timeout': 30,
 }
 
 # Queue and playback state management
 music_queue = {}
 currently_playing = {}
 is_playing = {}
+
+telegram_app_instance = None
+
+def set_telegram_app(app):
+    global telegram_app_instance
+    telegram_app_instance = app
+
+async def send_message_to_chat(chat_id, message):
+    """Send a message to a specific chat"""
+    global telegram_app_instance
+    if telegram_app_instance:
+        try:
+            await telegram_app_instance.bot.send_message(chat_id=chat_id, text=message)
+        except Exception as e:
+            logger.error(f"Failed to send message to chat {chat_id}: {e}")
+    else:
+        logger.warning(f"Telegram app instance not set, can't send message to {chat_id}")
 
 def get_spotify_tracks(playlist_link):
     """Extract all tracks from Spotify playlist"""
@@ -75,14 +138,29 @@ def get_spotify_tracks(playlist_link):
             
             results = sp.next(results) if results["next"] else None
     except Exception as e:
-        print(f"Spotify error: {e}")
+        logger.error(f"Spotify error: {e}")
     
     return tracks
 
-def search_youtube(query):
-    """Search YouTube for a song and return audio URL"""
-    with YoutubeDL(YDL_OPTIONS) as ydl:
-        try:
+import concurrent.futures
+
+async def search_youtube_async(query, max_retries=3):
+    """Asynchronously search YouTube for a song and return audio URL with retry logic"""
+    for attempt in range(max_retries):
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            result = await loop.run_in_executor(pool, search_youtube_sync, query)
+            if result:
+                return result
+            if attempt < max_retries - 1:  # Don't wait after the last attempt
+                logger.info(f"YouTube search attempt {attempt + 1} failed for '{query}', retrying in {2 ** attempt} seconds...")
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+    return None
+
+def search_youtube_sync(query):
+    """Synchronous version of YouTube search"""
+    try:
+        with YoutubeDL(YDL_OPTIONS) as ydl:
             info = ydl.extract_info(f"ytsearch:{query}", download=False)
             if 'entries' in info and len(info['entries']) > 0:
                 video = info['entries'][0]
@@ -92,9 +170,19 @@ def search_youtube(query):
                     'duration': video.get('duration', 0),
                     'webpage_url': video.get('webpage_url', '')
                 }
-        except Exception as e:
-            print(f"YouTube search error: {e}")
+    except Exception as e:
+        logger.error(f"YouTube search error for query '{query}': {e}")
+        if "timeout" in str(e).lower() or "network" in str(e).lower():
+            logger.warning(f"Network error during search for '{query}'")
+        elif "unavailable" in str(e).lower():
+            logger.warning(f"Video unavailable for '{query}'")
     return None
+
+# Keep the old function for backward compatibility
+def search_youtube(query):
+    """Search YouTube for a song and return audio URL"""
+    logger.warning("Using deprecated synchronous search_youtube function")
+    return search_youtube_sync(query)
 
 # Event handler for when stream ends
 @calls.on_stream_end()
@@ -102,7 +190,7 @@ async def on_stream_end(client, update):
     """Called when a song finishes playing"""
     chat_id = update.chat_id
     
-    print(f"Stream ended in chat {chat_id}")
+    logger.info(f"Stream ended in chat {chat_id}")
     
     if chat_id in music_queue and music_queue[chat_id]:
         music_queue[chat_id].pop(0)  # Remove finished song
@@ -125,13 +213,13 @@ async def play_next_song(chat_id):
         return
     
     current_song = music_queue[chat_id][0]
-    print(f"Playing next: {current_song}")
+    logger.info(f"Playing next: {current_song}")
     
     # Search YouTube
-    result = search_youtube(current_song)
+    result = await search_youtube_async(current_song)
     
     if not result:
-        print(f"Couldn't find: {current_song}")
+        logger.warning(f"Couldn't find: {current_song}")
         music_queue[chat_id].pop(0)
         if music_queue[chat_id]:
             await play_next_song(chat_id)
@@ -146,22 +234,41 @@ async def play_next_song(chat_id):
         'query': current_song
     }
     
-    try:
-        # Play the audio stream
-        await calls.play(
-            chat_id,
-            MediaStream(result['url'])
-        )
-        is_playing[chat_id] = True
-        print(f"Now playing in {chat_id}: {result['title']}")
-        
-    except Exception as e:
-        print(f"Error playing: {e}")
-        music_queue[chat_id].pop(0)
-        if music_queue[chat_id]:
-            await play_next_song(chat_id)
-        else:
+    # Try to play the stream with retry logic
+    max_play_retries = 3
+    for attempt in range(max_play_retries):
+        try:
+            # Play the audio stream
+            await calls.play(
+                chat_id,
+                MediaStream(result['url'])
+            )
+            is_playing[chat_id] = True
+            logger.info(f"Now playing in {chat_id}: {result['title']}")
+            return  # Success, exit the function
+        except NoActiveGroupCall:
+            logger.error(f"No active voice chat in chat {chat_id}")
+            await send_message_to_chat(chat_id, "❌ No active voice chat! Please start a voice chat first.")
             is_playing[chat_id] = False
+            return
+        except GroupCallNotFound:
+            logger.error(f"Group call not found in chat {chat_id}")
+            await send_message_to_chat(chat_id, "❌ Bot doesn't have permission to join voice chat. Make sure it's added as admin with 'Manage Voice Chats' permission.")
+            is_playing[chat_id] = False
+            return
+        except Exception as e:
+            logger.error(f"Error playing in chat {chat_id} (attempt {attempt + 1}): {e}")
+            if attempt < max_play_retries - 1:  # If not the last attempt
+                logger.info(f"Retrying in {2 ** attempt} seconds...")
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                # All retries failed, move to next song
+                logger.error(f"All attempts failed for {result['title']}, moving to next song")
+                music_queue[chat_id].pop(0)
+                if music_queue[chat_id]:
+                    await play_next_song(chat_id)
+                else:
+                    is_playing[chat_id] = False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
@@ -382,19 +489,22 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot"""
-    print("🚀 Starting bot...")
+    logger.info("🚀 Starting bot...")
     
     # Start Pyrogram client
     pyrogram_app.start()
-    print("✅ Pyrogram client started")
+    logger.info("✅ Pyrogram client started")
     
     # Start PyTgCalls
     loop = asyncio.get_event_loop()
     loop.run_until_complete(calls.start())
-    print("✅ PyTgCalls started")
+    logger.info("✅ PyTgCalls started")
     
     # Build telegram bot
     telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Set the global telegram app instance for use in other functions
+    set_telegram_app(telegram_app)
     
     # Command handlers
     telegram_app.add_handler(CommandHandler("start", start))
@@ -407,21 +517,59 @@ def main():
     telegram_app.add_handler(CommandHandler("clear", clear_queue))
     telegram_app.add_handler(CommandHandler("stop", stop))
     
-    print("🤖 Bot is running!")
-    print("📝 Make sure to:")
-    print("   1. Add bot to your group")
-    print("   2. Make bot admin with 'Manage Voice Chats' permission")
-    print("   3. Start a voice chat in the group")
-    print("   4. Use /play command to start playing music")
-    print("\n⏹ Press Ctrl+C to stop")
+    logger.info("🤖 Bot is running!")
+    logger.info("📝 Make sure to:")
+    logger.info("   1. Add bot to your group")
+    logger.info("   2. Make bot admin with 'Manage Voice Chats' permission")
+    logger.info("   3. Start a voice chat in the group")
+    logger.info("   4. Use /play command to start playing music")
+    logger.info("\n⏹ Press Ctrl+C to stop")
     
-    telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal, shutting down gracefully...")
+    except Exception as e:
+        logger.error(f"Unexpected error during bot operation: {e}")
+    finally:
+        cleanup_resources()
+
+def cleanup_resources():
+    """Clean up resources when the bot stops"""
+    logger.info("🧹 Cleaning up resources...")
+    
+    # Stop PyTgCalls
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(calls.stop())
+        logger.info("✅ PyTgCalls stopped")
+    except Exception as e:
+        logger.error(f"Error stopping PyTgCalls: {e}")
+    
+    # Stop Pyrogram client
+    try:
+        pyrogram_app.stop()
+        logger.info("✅ Pyrogram client stopped")
+    except Exception as e:
+        logger.error(f"Error stopping Pyrogram client: {e}")
+    
+    # Leave all active voice chats
+    for chat_id in music_queue:
+        try:
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(calls.leave_group_call(chat_id))
+            logger.info(f"✅ Left voice chat in {chat_id}")
+        except Exception as e:
+            logger.error(f"Error leaving voice chat in {chat_id}: {e}")
+    
+    logger.info("👋 Bot stopped!")
+
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n👋 Bot stopped!")
+        logger.info("\n👋 Bot stopped!")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        logger.error(f"❌ Error: {e}")
         raise
